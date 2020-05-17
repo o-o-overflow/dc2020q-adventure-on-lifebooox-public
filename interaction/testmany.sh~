@@ -1,0 +1,8 @@
+#!/bin/bash
+
+for x in {1..20}; do
+
+python3 check1.py lifebooox.lb.isroot.com 37452
+
+done
+

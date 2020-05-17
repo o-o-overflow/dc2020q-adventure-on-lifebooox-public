@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+# vim: noexpandtab shiftwidth=8 softtabstop=0
+
+# TODO:
+#       deploy (registry + scoreboard + kill pods?)
+#       central tester
+
+FLAG_RE = r"OOO{[^}]*}\Z"
+SERVICE_NAME_RE = r"[a-z][a-z0-9-]+\Z"
+GITHUB_NAME_PREFIX = "dc2020q-"
+IMAGE_FMT = "dc2020q:%s"
+
+SHORTREAD_ALLOWED_DIFF = 2  # You can have this number of remaining processes (override: shortread_allowed_diff: -1)
+
+SELFUPDATE_INFO_URL = "https://jacopo.cc/ooo_latest_tester.json"   # Updated separately
+SELFUPDATE_GITHUB_URL = "git@github.com:o-o-overflow/dc2020q-template.git"
+
+import concurrent.futures
+import subprocess
+import argparse
+import tempfile
+import logging
+import shlex
+import json
+import yaml
+import time
+import sys
+import re
+import os
+import traceback
+
+logging.basicConfig()
+_LOG = logging.getLogger("OOO")
+_LOG.setLevel("DEBUG")
+try:
+	import coloredlogs
+	coloredlogs.install(logger=_LOG, level=_LOG.level)
+except ImportError:
+	pass
+
+
+service_dir = os.path.dirname(__file__)
+
+_LOG.info("USING YAML: %s/info.yml", service_dir)
+
+dsystem = os.system  # But see cmdline options
+def system_without_stdout(cmd):
+	p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+	out, _ = p.communicate()
+	if p.returncode != 0:
+		_LOG.warning("Command %s failed (%d). Stdout was: %s", cmd, p.returncode, out)
+	return p.returncode
+
+
+def update_myself():
+	_LOG.info("Checking for tester updates...")
+	import urllib.request, hashlib, time
+	with open(__file__, "rb") as mf:
+		my_sha256 = hashlib.sha256(mf.read()).hexdigest().lower()
+	try:
+		with urllib.request.urlopen(SELFUPDATE_INFO_URL, timeout=5) as u:
+			newinfo = json.load(u)
+		if newinfo['tester_sha256'].lower() == my_sha256 or newinfo.get("ignore", False):
+			return
+		_LOG.critical("THERE IS A NEW tester SCRIPT (or yours is different) -- please ./rebase_on_template.sh")
+		if 'commit_unixdate' in newinfo:
+			_LOG.info("The last upstream commit happened at " +
+					time.strftime('%a, %d %b %Y %H:%M:%S %Z', time.localtime(newinfo['commit_unixdate'])))
+		if ('CI' in os.environ) or not (sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()):
+			_LOG.warning("Not interactive, I won't ask to upgrade")
+			return
+		if input("Continue without updating? ") in ['y','Y','yes','YES','Yes']:
+			_LOG.info("OK. BTW, you can run me with --no-self-update if you don't want this check to happen.")
+			return
+		print("Good choice :) Plase run ./rebase_on_template.sh")
+		sys.exit(11)
+	except Exception as e:
+		_LOG.warning("Skipping self-update, got an exception: %s %s", type(e), str(e))
+
+
+def validate_git():  # Called as part of validate_yaml
+	if not os.path.exists(os.path.join(service_dir, ".git")):
+		_LOG.warning("I don't think I am in git -- skipping the github name check")
+		return
+	remotes_p = subprocess.run("git -C {} remote -v show -n|grep push|grep -oE '\S+github.com\S+'|grep o-o-overflow".format(shlex.quote(service_dir)),
+			shell=True, stdout=subprocess.PIPE, cwd=service_dir, universal_newlines=True)
+	if remotes_p.returncode != 0 or not remotes_p.stdout:
+		_LOG.warning("I don't see github among the remotes -- skipping the github name check")
+		return
+	def remote_ok(remote):
+		if ('2019' in remote) or ('2018' in remote):
+			_LOG.debug("Probably an old repo, skipping github repo name check")
+			return True
+		if remote.endswith('.git'):
+			remote = remote[:-4]
+		return remote.endswith('o-o-overflow/' + GITHUB_NAME_PREFIX + service_conf['service_name'])
+	if not any(remote_ok(r) for r in remotes_p.stdout.splitlines()):
+		_LOG.critical("The github repo name does not conform to the format! I'm expecting %s(service_name as in yaml) Either change the name or ask around. Remotes found: %s", GITHUB_NAME_PREFIX, remotes_p.stdout)
+		if not service_conf.get('violates_github_format'):
+			assert False, "you violated the github name format!"
+
+def validate_yaml():
+	_LOG.info("Validating yaml...")
+	assert 'service_name' in service_conf, "no service name specified"
+	if 'template' in service_conf['service_name'] and not os.path.abspath(service_dir).endswith('template'):
+		_LOG.critical("Looks like you didn't change the service_name from the template (it's: %s)", service_conf['service_name'])
+		assert False, "you must change the service_name"
+	if not re.match(SERVICE_NAME_RE, service_conf['service_name']):
+		_LOG.critical("Service name %s is unusual, will create issues with docker & co. -- can you change it? Regex: %s", service_conf['service_name'], SERVICE_NAME_RE)
+		if not service_conf['violates_name_format']:
+			assert False, "you violated the name format! Either change the name or ask around"
+	validate_git()
+	assert 'flag' in service_conf, "no service flag specified"
+	if 'test flag' in service_conf['flag']:
+		_LOG.critical("REMEMBER TO CHANGE THE FLAG: %s looks like the test flag", service_conf['flag'])
+	if not re.match(FLAG_RE, service_conf['flag']):
+		_LOG.critical("FLAG %s DOES NOT CONFORM TO THE FLAG FORMAT", service_conf['flag'])
+		if not service_conf['violates_flag_format']:
+			assert False, "you violated the flag format!"
+
+def build_service():
+	if os.path.exists(os.path.join(service_dir, "service", "Dockerfile")):
+		_LOG.info("Building service image...")
+		build_args = ""
+		if service_conf['copy_flag_using_build_arg']:
+			build_args = "--build-arg THE_FLAG='%s'" % service_conf["flag"]
+		assert dsystem("docker build %s -t %s %s/service" % (build_args, image_tag, service_dir)) == 0, "service docker image build failed"
+	else:
+		_LOG.warning("no dockerfile found for service...")
+
+def build_interactions():
+	if os.path.exists(os.path.join(service_dir, "interaction", "Dockerfile")):
+		_LOG.info("Building interaction image...")
+		assert dsystem("docker build -t %s %s/interaction" % (interaction_image_tag, service_dir)) == 0, "interaction docker image build failed"
+
+def _start_container():
+	_stop_container()
+	assert dsystem("docker run --name %s --rm -d %s" % (container_tag, image_tag)) == 0, "service container failed to start"
+def _stop_container():
+	dsystem("docker kill %s 2>/dev/null >/dev/null | true" % container_tag)
+	dsystem("docker rm %s 2>/dev/null >/dev/null | true" % container_tag)
+
+def launch_service():
+	_LOG.debug("starting container")
+	_start_container()
+	time.sleep(1)
+	container_config = json.loads(subprocess.check_output("docker inspect %s" % container_tag, shell=True).decode('utf-8'))
+	ip_address = container_config[0]['NetworkSettings']['Networks']['bridge']['IPAddress']
+	port = list(container_config[0]['Config']['ExposedPorts'].keys())[0].split("/")[0]
+	_LOG.debug("network endpoint: %s:%s", ip_address, port)
+	return ip_address, port
+
+def test_service(ip_address, port):
+	_LOG.info("Testing container...")
+
+	_LOG.info("launching interaction container")
+	interaction_container = subprocess.check_output("docker run --rm -i -d %s" % interaction_image_tag, shell=True).strip().decode('utf-8')
+
+	def _run_interaction(script):
+		_LOG.info("launching %s", script)
+
+		output = subprocess.check_output("docker exec %s %s %s %s" % (interaction_container, script, ip_address, port), shell=True)
+		if os.path.basename(script).startswith("exploit"):
+			_LOG.info("... checking for the flag")
+			assert service_conf['flag'].encode('utf-8') in output, "exploit %s did not print the flag"%script #pylint:disable=unsupported-membership-test
+
+	_LOG.info("launching interaction scripts")
+	interaction_files = service_conf['interactions']
+	for f in interaction_files:
+		_run_interaction(f)
+
+	_LOG.info("STRESS TEST TIME")
+	n = 2
+	old_level = _LOG.level
+	while n <= service_conf['concurrent_connections']:
+		_LOG.info("stress testing with %d concurrent connections!", n)
+		_LOG.setLevel(max(logging.WARNING, old_level))
+		with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+			results = pool.map(_run_interaction, (interaction_files*n)[:n])
+		try:
+			for result in results:
+				pass
+		except Exception as e:
+			_LOG.error('One iteration returns an exception: %s' % str(e))
+			_LOG.error(traceback.format_exc())
+			sys.exit(1)
+
+		_LOG.setLevel(old_level)
+
+		n *= 2
+
+	_LOG.info("SHORT-READ SANITY CHECK")
+	allowed = service_conf.get('shortread_allowed_diff', SHORTREAD_ALLOWED_DIFF)
+	if SHORTREAD_ALLOWED_DIFF >= 0:
+		start_num_procs = len(subprocess.check_output("docker exec %s ps aux" % container_tag, shell=True).splitlines())
+		assert os.system('docker run --rm ubuntu bash -ec "for i in {1..128}; do echo > /dev/tcp/%s/%s; done"' % (ip_address, port)) == 0
+		_LOG.info("waiting for service to clean up after short reads")
+		time.sleep(15)
+		final_num_procs = len(subprocess.check_output("docker exec %s ps aux" % container_tag, shell=True).splitlines())
+		assert final_num_procs < (start_num_procs + allowed), "your service did not clean up after short reads -- starting procs = {sp} final={fp}".format(sp=start_num_procs, fp=final_num_procs)
+	else:
+		_LOG.info("The short-read test is disabled")
+
+	_LOG.info("stopping interaction container")
+	dsystem("docker kill %s" % interaction_container)
+
+def build_bundle():
+
+	if 'public_files' in service_conf and service_conf['public_files']:
+
+		_LOG.info("building public bundle!")
+
+		tempdir = tempfile.mkdtemp()
+		public_path = os.path.join(tempdir, service_name)
+		os.makedirs(public_path)
+		for f in service_conf['public_files']:
+			_LOG.debug("copying file %s into public files", f)
+			cmd = "cp -L %s/%s %s/%s" % (service_dir, f, public_path, os.path.basename(f))
+			_LOG.debug("%s (cwd: %s)", cmd, os.getcwd())
+			assert dsystem(cmd) == 0, "failed to retrieve public file %s" % f
+
+		time.sleep(2)
+		assert dsystem("tar cvzf %s/public_bundle.tar.gz -C %s %s" % (service_dir, tempdir, service_name)) == 0, "public file tarball failed; this should not be your fault"
+
+		print("")
+		print("")
+		_LOG.critical("PLEASE VERIFY THAT THIS IS CORRECT: files in public bundle:")
+		os.system("tar tvzf %s/public_bundle.tar.gz" % service_dir)
+
+		_stop_container()
+
+		print("")
+		print("")
+		print("^^^ Please check the public files. IF YOUR SERVICE IS ALREADY ON THE SCOREBOARD, YOU MUST YELL AT ADAM TO CHANGE THEM")
+		print("")
+		print("")
+
+	else:
+		print("")
+		print("")
+		print("^^^ \033[36m No Public Files Found \033[0m")
+		print("")
+		print("")
+
+
+
+if __name__ == '__main__':
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--no-self-update", action="store_true", help="No self-update remote check")
+	parser.add_argument("--log-level", metavar='LVL', help="WARNING will also sink docker output. Default: DEBUG")
+	parser.add_argument("--use-cwd", action="store_true", help="Use CWD instead of script location for service directory")
+	parser.add_argument("cmds", metavar='CMD...', nargs=argparse.REMAINDER, help="Usual tester stuff: nothing / bundle, build, test, launch, deploy, ...")
+
+	args = parser.parse_args()
+	if args.log_level:
+		_LOG.setLevel(args.log_level)
+	if _LOG.getEffectiveLevel() >= logging.WARNING:
+		dsystem = system_without_stdout
+
+	sys.argv = [sys.argv[0]] + args.cmds
+
+	if not args.no_self_update:
+		update_myself()
+
+	if args.use_cwd:
+		service_dir = os.getcwd()
+
+	with open(os.path.join(service_dir, "info.yml")) as yf:
+		service_conf = yaml.safe_load(yf)
+	service_name = service_conf['service_name']
+	_LOG.info("SERVICE ID: %s", service_name)
+
+	image_tag = IMAGE_FMT % service_name
+	interaction_image_tag = IMAGE_FMT % service_name + '-interaction'
+	container_tag = "running-%s" % service_name
+
+	validate_yaml()
+
+	arg = sys.argv[1] if len(sys.argv) >= 2 else ""
+	if arg == 'bundle':
+		build_bundle()
+	elif arg == 'build':
+		build_service()
+		build_interactions()
+		build_bundle()
+	elif arg == 'test':
+		if len(sys.argv) == 2:
+			_ip_address, _port = launch_service()
+			test_service(_ip_address, _port)
+		else:
+			test_service(sys.argv[2], int(sys.argv[3]))
+	elif arg == 'launch':
+		build_service()
+		try:
+			_ip_address, _port = launch_service()
+			print("")
+			print("SERVICE RUNNING AT: %s %s" % (_ip_address, _port))
+			print("nc %s %s" % (_ip_address, _port))
+			print("./tester test %s %s" % (_ip_address, _port))
+			print("%s:%s" % (_ip_address, _port))
+			input()
+		finally:
+			_stop_container()
+	elif arg == 'deploy':
+		registry = sys.argv[2]
+		tagcmd = "docker tag dc2020q:%s %s:5000/dc2020q-%s:latest" % (service_name.lower(), registry, service_name.lower())
+		print(tagcmd)
+		assert dsystem(tagcmd) == 0
+		pushcmd = "docker push %s:5000/dc2020q-%s:latest" % (registry, service_name.lower())
+		print(pushcmd)
+		assert dsystem(pushcmd) == 0
+		print("IF YOUR SERVICE IS ALREADY DEPLOYED: kill pods")
+		print("IF YOUR SERVICE IS ALREADY ON THE SCOREBOARD: yell at Adam to update the public files there")
+	else:
+		try:
+			build_service()
+			build_interactions()
+			_ip_address, _port = launch_service()
+			test_service(_ip_address, _port)
+			build_bundle()
+		finally:
+			_stop_container()
